@@ -10,9 +10,10 @@ venv/
 env/
 .env/
 
-# Generated files from entropy_crop_pdf.py
+# Generated files
 entropy_plots/
 spectrums/
+debug_output/
 
 # Common output PDF naming conventions to avoid committing generated files
 *output.pdf

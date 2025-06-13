@@ -83,6 +83,21 @@ def analyze_page_entropy(gray_img):
     # Calculate gradients
     vertical_gradient = np.gradient(vertical_entropy)
     horizontal_gradient = np.gradient(horizontal_entropy)
+
+    # --- New: Calculate trailing average of scanning entropy and its gradient ---
+    # Use a window that is 2% of the dimension, with a minimum of 10 pixels
+    vert_ma_window = max(10, int(height * 0.02))
+    horz_ma_window = max(10, int(width * 0.02))
+
+    def moving_average(data, window_size):
+        """Calculates moving average using convolution."""
+        return np.convolve(data, np.ones(window_size), 'same') / window_size
+
+    vertical_scanning_avg = moving_average(vertical_scanning, vert_ma_window)
+    horizontal_scanning_avg = moving_average(horizontal_scanning, horz_ma_window)
+
+    vertical_scanning_avg_gradient = np.gradient(vertical_scanning_avg)
+    horizontal_scanning_avg_gradient = np.gradient(horizontal_scanning_avg)
     
     # Normalize all measures to [0, 1] range for plotting
     def normalize(arr):
@@ -97,23 +112,31 @@ def analyze_page_entropy(gray_img):
             'entropy': normalize(vertical_entropy),
             'scanning': normalize(vertical_scanning),
             'gradient': vertical_gradient,  # Return raw gradient
-            'gradient_normalized': normalize(vertical_gradient) # For plotting
+            'gradient_normalized': normalize(vertical_gradient), # For plotting
+            'scanning_avg': normalize(vertical_scanning_avg),
+            'scanning_avg_gradient': vertical_scanning_avg_gradient,
+            'scanning_avg_gradient_normalized': normalize(vertical_scanning_avg_gradient),
         },
         'horizontal': {
             'entropy': normalize(horizontal_entropy),
             'scanning': normalize(horizontal_scanning),
             'gradient': horizontal_gradient, # Return raw gradient
-            'gradient_normalized': normalize(horizontal_gradient) # For plotting
+            'gradient_normalized': normalize(horizontal_gradient), # For plotting
+            'scanning_avg': normalize(horizontal_scanning_avg),
+            'scanning_avg_gradient': horizontal_scanning_avg_gradient,
+            'scanning_avg_gradient_normalized': normalize(horizontal_scanning_avg_gradient),
         }
     }
 
-def find_crop_boundaries(entropy_data, gradient_threshold=0.05):
+def find_crop_boundaries(entropy_data, gradient_threshold=0.05, conservative_gradient_threshold=0.005):
     """
     Determine crop boundaries by finding the largest peaks in the entropy gradient.
     This version uses the raw gradient to distinguish between positive (margin-to-content)
     and negative (content-to-margin) transitions.
+    It also finds a second, more conservative boundary if the primary crop is large.
     """
     boundaries = {}
+    conservative_boundaries = {}
 
     # --- Vertical Scan (Top and Bottom) ---
     vertical_gradient = entropy_data['vertical']['gradient']
@@ -125,11 +148,11 @@ def find_crop_boundaries(entropy_data, gradient_threshold=0.05):
     top_peak_value = top_search_area[top_peak_index]
     
     if top_peak_value > gradient_threshold:
-        boundaries['top'] = top_peak_index
-        print(f"Found top boundary at {boundaries['top']} (gradient: {top_peak_value:.3f})")
+        boundaries['top'] = top_peak_index + 1
+        print(f"Found top boundary at {top_peak_index}, adjusting inward to {boundaries['top']} (gradient: {top_peak_value:.3f})")
     else:
-        boundaries['top'] = 0
-        print(f"No significant top boundary (max grad: {top_peak_value:.3f}). Defaulting to 0.")
+        boundaries['top'] = 1
+        print(f"No significant top boundary (max grad: {top_peak_value:.3f}). Defaulting to 1.")
 
     # Find Bottom Boundary: Search for the min negative gradient in the bottom half
     bottom_search_area = vertical_gradient[height//2:]
@@ -138,11 +161,11 @@ def find_crop_boundaries(entropy_data, gradient_threshold=0.05):
     bottom_peak_value = bottom_search_area[bottom_peak_offset]
     
     if bottom_peak_value < -gradient_threshold:
-        boundaries['bottom'] = bottom_peak_index
-        print(f"Found bottom boundary at {boundaries['bottom']} (gradient: {bottom_peak_value:.3f})")
+        boundaries['bottom'] = bottom_peak_index - 1
+        print(f"Found bottom boundary at {bottom_peak_index}, adjusting inward to {boundaries['bottom']} (gradient: {bottom_peak_value:.3f})")
     else:
-        boundaries['bottom'] = height
-        print(f"No significant bottom boundary (min grad: {bottom_peak_value:.3f}). Defaulting to {height}.")
+        boundaries['bottom'] = height - 1
+        print(f"No significant bottom boundary (min grad: {bottom_peak_value:.3f}). Defaulting to {height - 1}.")
 
     # --- Horizontal Scan (Left and Right) ---
     horizontal_gradient = entropy_data['horizontal']['gradient']
@@ -154,11 +177,11 @@ def find_crop_boundaries(entropy_data, gradient_threshold=0.05):
     left_peak_value = left_search_area[left_peak_index]
 
     if left_peak_value > gradient_threshold:
-        boundaries['left'] = left_peak_index
-        print(f"Found left boundary at {boundaries['left']} (gradient: {left_peak_value:.3f})")
+        boundaries['left'] = left_peak_index + 1
+        print(f"Found left boundary at {left_peak_index}, adjusting inward to {boundaries['left']} (gradient: {left_peak_value:.3f})")
     else:
-        boundaries['left'] = 0
-        print(f"No significant left boundary (max grad: {left_peak_value:.3f}). Defaulting to 0.")
+        boundaries['left'] = 1
+        print(f"No significant left boundary (max grad: {left_peak_value:.3f}). Defaulting to 1.")
 
     # Find Right Boundary: Search for the min negative gradient in the right half
     right_search_area = horizontal_gradient[width//2:]
@@ -167,11 +190,81 @@ def find_crop_boundaries(entropy_data, gradient_threshold=0.05):
     right_peak_value = right_search_area[right_peak_offset]
     
     if right_peak_value < -gradient_threshold:
-        boundaries['right'] = right_peak_index
-        print(f"Found right boundary at {boundaries['right']} (gradient: {right_peak_value:.3f})")
+        boundaries['right'] = right_peak_index - 1
+        print(f"Found right boundary at {right_peak_index}, adjusting inward to {boundaries['right']} (gradient: {right_peak_value:.3f})")
     else:
-        boundaries['right'] = width
-        print(f"No significant right boundary (min grad: {right_peak_value:.3f}). Defaulting to {width}.")
+        boundaries['right'] = width - 1
+        print(f"No significant right boundary (min grad: {right_peak_value:.3f}). Defaulting to {width - 1}.")
+
+    # --- Conservative Boundary Search ---
+    # If the primary crop for a side is > 5% of the page dimension,
+    # search for a more conservative boundary within that margin area.
+    print("\nSearching for conservative boundaries...")
+
+    # Top Conservative Boundary
+    if boundaries['top'] > height * 0.05:
+        grad = entropy_data['vertical']['scanning_avg_gradient']
+        search_area = grad[0:boundaries['top']]
+        peak_index = np.argmax(search_area)
+        peak_value = search_area[peak_index]
+
+        if peak_value > conservative_gradient_threshold:
+            conservative_boundaries['top'] = peak_index + 1
+            print(f"Found conservative top boundary at {peak_index}, adjusting to {conservative_boundaries['top']}")
+        else:
+            conservative_boundaries['top'] = boundaries['top']
+            print("No secondary top peak found, using primary boundary.")
+    else:
+        conservative_boundaries['top'] = boundaries['top']
+
+    # Bottom Conservative Boundary
+    if boundaries['bottom'] < height * 0.95:
+        grad = entropy_data['vertical']['scanning_avg_gradient']
+        search_area = grad[boundaries['bottom']:]
+        peak_offset = np.argmin(search_area)
+        peak_value = search_area[peak_offset]
+        
+        if peak_value < -conservative_gradient_threshold:
+            conservative_boundaries['bottom'] = boundaries['bottom'] + peak_offset - 1
+            print(f"Found conservative bottom boundary at {boundaries['bottom'] + peak_offset}, adjusting to {conservative_boundaries['bottom']}")
+        else:
+            conservative_boundaries['bottom'] = boundaries['bottom']
+            print("No secondary bottom peak found, using primary boundary.")
+    else:
+        conservative_boundaries['bottom'] = boundaries['bottom']
+
+    # Left Conservative Boundary
+    if boundaries['left'] > width * 0.05:
+        grad = entropy_data['horizontal']['scanning_avg_gradient']
+        search_area = grad[0:boundaries['left']]
+        peak_index = np.argmax(search_area)
+        peak_value = search_area[peak_index]
+
+        if peak_value > conservative_gradient_threshold:
+            conservative_boundaries['left'] = peak_index + 1
+            print(f"Found conservative left boundary at {peak_index}, adjusting to {conservative_boundaries['left']}")
+        else:
+            conservative_boundaries['left'] = boundaries['left']
+            print("No secondary left peak found, using primary boundary.")
+    else:
+        conservative_boundaries['left'] = boundaries['left']
+
+    # Right Conservative Boundary
+    if boundaries['right'] < width * 0.95:
+        grad = entropy_data['horizontal']['scanning_avg_gradient']
+        search_area = grad[boundaries['right']:]
+        peak_offset = np.argmin(search_area)
+        peak_value = search_area[peak_offset]
+
+        if peak_value < -conservative_gradient_threshold:
+            conservative_boundaries['right'] = boundaries['right'] + peak_offset - 1
+            print(f"Found conservative right boundary at {boundaries['right'] + peak_offset}, adjusting to {conservative_boundaries['right']}")
+        else:
+            conservative_boundaries['right'] = boundaries['right']
+            print("No secondary right peak found, using primary boundary.")
+    else:
+        conservative_boundaries['right'] = boundaries['right']
+
 
     # --- Final Validation ---
     # Ensure boundaries are logical (top < bottom, left < right)
@@ -185,9 +278,19 @@ def find_crop_boundaries(entropy_data, gradient_threshold=0.05):
         boundaries['left'] = 0
         boundaries['right'] = width
         
-    return boundaries
+    if conservative_boundaries.get('top', 0) >= conservative_boundaries.get('bottom', height):
+        print(f"Warning: Invalid conservative vertical boundaries. Resetting to page edges.")
+        conservative_boundaries['top'] = 0
+        conservative_boundaries['bottom'] = height
+        
+    if conservative_boundaries.get('left', 0) >= conservative_boundaries.get('right', width):
+        print(f"Warning: Invalid conservative horizontal boundaries. Resetting to page edges.")
+        conservative_boundaries['left'] = 0
+        conservative_boundaries['right'] = width
+        
+    return boundaries, conservative_boundaries
 
-def draw_entropy_overlay(page, entropy_data, metrics_to_plot, dpi, crop_rect=None):
+def draw_entropy_overlay(page, entropy_data, metrics_to_plot, dpi, crop_rect=None, conservative_crop_rect=None):
     """
     Draws the selected entropy curves and the proposed crop box directly onto the PDF page.
     """
@@ -198,6 +301,33 @@ def draw_entropy_overlay(page, entropy_data, metrics_to_plot, dpi, crop_rect=Non
     }
     scaling = dpi / 72.0
     page_rect = page.rect
+
+    # --- Draw Conservative Crop Box ---
+    if conservative_crop_rect and not conservative_crop_rect.is_empty:
+        corner_size = 15
+        corner_color = (0, 1, 0) # Green for conservative
+        corner_width = 1.5
+        
+        # Top-Left
+        tl = conservative_crop_rect.tl
+        page.draw_line(tl, tl + (corner_size, 0), color=corner_color, width=corner_width)
+        page.draw_line(tl, tl + (0, corner_size), color=corner_color, width=corner_width)
+        
+        # Top-Right
+        tr = conservative_crop_rect.tr
+        page.draw_line(tr, tr - (corner_size, 0), color=corner_color, width=corner_width)
+        page.draw_line(tr, tr + (0, corner_size), color=corner_color, width=corner_width)
+
+        # Bottom-Left
+        bl = conservative_crop_rect.bl
+        page.draw_line(bl, bl + (corner_size, 0), color=corner_color, width=corner_width)
+        page.draw_line(bl, bl - (0, corner_size), color=corner_color, width=corner_width)
+
+        # Bottom-Right
+        br = conservative_crop_rect.br
+        page.draw_line(br, br - (corner_size, 0), color=corner_color, width=corner_width)
+        page.draw_line(br, br - (0, corner_size), color=corner_color, width=corner_width)
+
 
     # --- Draw Proposed Crop Box Corners ---
     if crop_rect and not crop_rect.is_empty:
@@ -302,6 +432,8 @@ def main():
                         help="Overlay entropy curves on the output PDF instead of cropping. "
                              "When specified, no cropping is performed. "
                              "Can specify one or more metrics to plot.")
+    parser.add_argument("--conservative", action="store_true", 
+                        help="Use conservative cropping boundaries if a large crop is detected.")
     args = parser.parse_args()
 
     # Validate input file
@@ -339,7 +471,7 @@ def main():
         if args.overlay:
             # --- Overlay Mode ---
             # Find crop boundaries to visualize them
-            boundaries = find_crop_boundaries(entropy_data)
+            boundaries, conservative_boundaries = find_crop_boundaries(entropy_data)
             scaling = args.dpi / 72.0
             crop_rect = fitz.Rect(
                 boundaries['left'] / scaling,
@@ -348,6 +480,14 @@ def main():
                 boundaries['bottom'] / scaling
             )
             crop_rect = crop_rect & page.mediabox
+            
+            conservative_crop_rect = fitz.Rect(
+                conservative_boundaries['left'] / scaling,
+                conservative_boundaries['top'] / scaling,
+                conservative_boundaries['right'] / scaling,
+                conservative_boundaries['bottom'] / scaling
+            )
+            conservative_crop_rect = conservative_crop_rect & page.mediabox
 
             if crop_rect.is_empty or crop_rect.width <= 0 or crop_rect.height <= 0:
                 print("Warning: Proposed crop is a degenerate rectangle. Will not be drawn.")
@@ -358,13 +498,19 @@ def main():
                 print(f"  (x0, y0, x1, y1): ({crop_rect.x0:.1f}, {crop_rect.y0:.1f}, {crop_rect.x1:.1f}, {crop_rect.y1:.1f})")
             else:
                 print("  None")
+            
+            print("Conservative crop box (points):")
+            if conservative_crop_rect:
+                 print(f"  (x0, y0, x1, y1): ({conservative_crop_rect.x0:.1f}, {conservative_crop_rect.y0:.1f}, {conservative_crop_rect.x1:.1f}, {conservative_crop_rect.y1:.1f})")
+            else:
+                print("  None")
 
             # Create a new page in out_doc that is a copy of the original
             out_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
             out_page.show_pdf_page(out_page.rect, doc, page_num)
             
             # Draw the entropy curves and crop box on the new page
-            draw_entropy_overlay(out_page, entropy_data, args.overlay, args.dpi, crop_rect)
+            draw_entropy_overlay(out_page, entropy_data, args.overlay, args.dpi, crop_rect, conservative_crop_rect)
             print(f"Added entropy overlays and crop box outline for page {page_num + 1}")
 
         else:
@@ -373,14 +519,17 @@ def main():
             plot_entropy_curves(page_num + 1, entropy_data, args.plot_dir)
             
             # Find crop boundaries
-            boundaries = find_crop_boundaries(entropy_data)
+            boundaries, conservative_boundaries = find_crop_boundaries(entropy_data)
+
+            # Choose which boundaries to use
+            final_boundaries = conservative_boundaries if args.conservative else boundaries
             
             # Convert pixel coordinates to PDF points
             scaling = args.dpi / 72.0  # DPI to points conversion
-            left = boundaries['left'] / scaling
-            top = boundaries['top'] / scaling
-            right = boundaries['right'] / scaling
-            bottom = boundaries['bottom'] / scaling
+            left = final_boundaries['left'] / scaling
+            top = final_boundaries['top'] / scaling
+            right = final_boundaries['right'] / scaling
+            bottom = final_boundaries['bottom'] / scaling
             
             # Create crop rectangle
             crop_rect = fitz.Rect(left, top, right, bottom)
@@ -424,38 +573,69 @@ def main():
         print(f"\nCropped PDF saved to '{args.output_pdf}'. Entropy plots are in '{args.plot_dir}'.")
 
 def plot_entropy_curves(page_num, entropy_data, output_dir):
-    """Generate plots showing entropy analysis for vertical and horizontal scans."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
-    fig.suptitle(f'Page {page_num} Entropy Analysis', fontsize=16)
+    """
+    Generate separate plot files for vertical and horizontal scans for each page,
+    with plots separated into logical groups.
+    """
+    # --- Plot Vertical Scan Data ---
+    fig_vert, (ax_vert1, ax_vert2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+    fig_vert.suptitle(f'Page {page_num} Vertical Scan Analysis', fontsize=16)
     
-    # Plot vertical scan (top to bottom)
     vertical = entropy_data['vertical']
     x_vert = np.arange(len(vertical['entropy']))
-    ax1.plot(x_vert, vertical['entropy'], 'b-', label='Line Entropy', alpha=0.7)
-    ax1.plot(x_vert, vertical['scanning'], 'g-', label='Scanning Entropy', alpha=0.7)
-    ax1.plot(x_vert, vertical['gradient_normalized'], 'r--', label='Normalized Gradient', alpha=0.5)
-    ax1.set_title("Vertical Scan (Top to Bottom)")
-    ax1.set_xlabel('Position (pixels)')
-    ax1.set_ylabel('Value')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
     
-    # Plot horizontal scan (left to right)
+    # Top subplot: Entropy values
+    ax_vert1.plot(x_vert, vertical['entropy'], 'b-', label='Line Entropy', alpha=0.7)
+    ax_vert1.plot(x_vert, vertical['scanning'], 'g-', label='Scanning Entropy', alpha=0.7)
+    ax_vert1.plot(x_vert, vertical['scanning_avg'], 'c-', label='Scanning Entropy (Avg)', alpha=0.6)
+    ax_vert1.set_title("Entropy Values")
+    ax_vert1.set_ylabel('Normalized Value')
+    ax_vert1.grid(True, alpha=0.3)
+    ax_vert1.legend()
+    
+    # Bottom subplot: Gradient values
+    ax_vert2.plot(x_vert, vertical['gradient_normalized'], 'r--', label='Normalized Gradient', alpha=0.5)
+    ax_vert2.plot(x_vert, vertical['scanning_avg_gradient_normalized'], 'm--', label='Scanning Avg Gradient (Norm)', alpha=0.5)
+    ax_vert2.set_title("Gradient Values")
+    ax_vert2.set_xlabel('Position (pixels, Top to Bottom)')
+    ax_vert2.set_ylabel('Normalized Value')
+    ax_vert2.grid(True, alpha=0.3)
+    ax_vert2.legend()
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust for suptitle
+    plot_path_vert = os.path.join(output_dir, f"page_{page_num}_vertical_analysis.png")
+    plt.savefig(plot_path_vert, dpi=150)
+    plt.close(fig_vert)
+
+    # --- Plot Horizontal Scan Data ---
+    fig_horz, (ax_horz1, ax_horz2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+    fig_horz.suptitle(f'Page {page_num} Horizontal Scan Analysis', fontsize=16)
+    
     horizontal = entropy_data['horizontal']
     x_horz = np.arange(len(horizontal['entropy']))
-    ax2.plot(x_horz, horizontal['entropy'], 'b-', label='Line Entropy', alpha=0.7)
-    ax2.plot(x_horz, horizontal['scanning'], 'g-', label='Scanning Entropy', alpha=0.7)
-    ax2.plot(x_horz, horizontal['gradient_normalized'], 'r--', label='Normalized Gradient', alpha=0.5)
-    ax2.set_title("Horizontal Scan (Left to Right)")
-    ax2.set_xlabel('Position (pixels)')
-    ax2.set_ylabel('Value')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
     
-    plt.tight_layout()
-    plot_path = os.path.join(output_dir, f"page_{page_num}_analysis.png")
-    plt.savefig(plot_path, dpi=150)
-    plt.close()
+    # Top subplot: Entropy values
+    ax_horz1.plot(x_horz, horizontal['entropy'], 'b-', label='Line Entropy', alpha=0.7)
+    ax_horz1.plot(x_horz, horizontal['scanning'], 'g-', label='Scanning Entropy', alpha=0.7)
+    ax_horz1.plot(x_horz, horizontal['scanning_avg'], 'c-', label='Scanning Entropy (Avg)', alpha=0.6)
+    ax_horz1.set_title("Entropy Values")
+    ax_horz1.set_ylabel('Normalized Value')
+    ax_horz1.grid(True, alpha=0.3)
+    ax_horz1.legend()
+    
+    # Bottom subplot: Gradient values
+    ax_horz2.plot(x_horz, horizontal['gradient_normalized'], 'r--', label='Normalized Gradient', alpha=0.5)
+    ax_horz2.plot(x_horz, horizontal['scanning_avg_gradient_normalized'], 'm--', label='Scanning Avg Gradient (Norm)', alpha=0.5)
+    ax_horz2.set_title("Gradient Values")
+    ax_horz2.set_xlabel('Position (pixels, Left to Right)')
+    ax_horz2.set_ylabel('Normalized Value')
+    ax_horz2.grid(True, alpha=0.3)
+    ax_horz2.legend()
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust for suptitle
+    plot_path_horz = os.path.join(output_dir, f"page_{page_num}_horizontal_analysis.png")
+    plt.savefig(plot_path_horz, dpi=150)
+    plt.close(fig_horz)
 
 if __name__ == "__main__":
     main()

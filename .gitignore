@@ -1,0 +1,23 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# Generated files from entropy_crop_pdf.py
+entropy_plots/
+spectrums/
+
+# Common output PDF naming conventions to avoid committing generated files
+*output.pdf
+*cropped.pdf
+*overlay.pdf
+
+# temp files
+*~
